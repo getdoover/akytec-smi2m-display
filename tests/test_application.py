@@ -412,3 +412,103 @@ class TestRPC:
     async def test_get_status_reads_flash_budget(self, app):
         await app.rpc_get_status(None, {})
         assert app.tags.flash_cycles_remaining.get() == 99
+
+
+class TestCountdown:
+    async def test_shows_the_first_value_immediately(self, app):
+        result = await app.rpc_countdown(None, {"seconds": 300})
+        assert result["counting_down"] is True
+        assert result["displayed"] == "300"
+        # Fired the instant the pump starts, not one loop later.
+        assert dict(app.modbus_iface.pop())[REG_VALUE_REAL] is not None
+
+    async def test_counts_down_on_each_tick(self, app):
+        await app.rpc_countdown(None, {"seconds": 300})
+        app._countdown_ends_at = time.monotonic() + 120.4
+        await app.main_loop()
+        # Ceiling: the sign reads 121 until the 121st second is fully gone.
+        assert app.status()["displayed"] == "121"
+
+    async def test_recomputed_from_deadline_not_decremented(self, app):
+        await app.rpc_countdown(None, {"seconds": 300})
+        app._countdown_ends_at = time.monotonic() + 10
+        await app.main_loop()
+        await app.main_loop()
+        await app.main_loop()
+        # Three ticks, but only real time advances the count — no drift.
+        assert app.status()["displayed"] == "10"
+
+    async def test_blanks_at_zero(self, app):
+        await app.rpc_countdown(None, {"seconds": 5})
+        app._countdown_ends_at = time.monotonic() - 0.01
+        await app.main_loop()
+        assert app.tags.is_blank.get() is True
+        assert app.status()["counting_down"] is False
+
+    async def test_can_hold_zero_instead_of_blanking(self, app):
+        await app.rpc_countdown(None, {"seconds": 5, "blank_at_zero": False})
+        app._countdown_ends_at = time.monotonic() - 0.01
+        await app.main_loop()
+        assert app.status()["displayed"] == "0"
+        assert app.tags.is_blank.get() is False
+
+    async def test_colour_thresholds(self, app):
+        await app.rpc_countdown(
+            None, {"seconds": 300, "warn_at": 60, "critical_at": 10}
+        )
+        assert app.status()["colour"] == "green"
+
+        app._countdown_ends_at = time.monotonic() + 45
+        await app.main_loop()
+        assert app.status()["colour"] == "yellow"
+
+        app._countdown_ends_at = time.monotonic() + 5
+        await app.main_loop()
+        assert app.status()["colour"] == "red"
+
+    async def test_no_blank_timeout_while_counting(self, app):
+        await app.rpc_countdown(None, {"seconds": 300})
+        # The configured 300s blank must not fight the countdown for the panel.
+        assert app._expires_at is None
+
+    async def test_set_value_supersedes_a_countdown(self, app):
+        await app.rpc_countdown(None, {"seconds": 300})
+        await app.rpc_set_value(None, {"value": 42})
+        assert app.status()["counting_down"] is False
+        await app.main_loop()
+        assert app.status()["displayed"] == "42"
+
+    async def test_blank_cancels_a_countdown(self, app):
+        await app.rpc_countdown(None, {"seconds": 300})
+        await app.rpc_blank(None, {})
+        assert app.status()["counting_down"] is False
+        await app.main_loop()
+        assert app.tags.is_blank.get() is True
+
+    async def test_a_failed_write_does_not_end_the_countdown(self, app):
+        await app.rpc_countdown(None, {"seconds": 300})
+        app.modbus_iface.fail = True
+        app._countdown_ends_at = time.monotonic() + 100
+        await app.main_loop()
+        # A dropped frame loses one tick; the next second re-asserts it.
+        assert app.status()["counting_down"] is True
+        app.modbus_iface.fail = False
+        await app.main_loop()
+        assert app.status()["displayed"] == "100"
+
+    @pytest.mark.parametrize(
+        "bad", [{}, {"seconds": 0}, {"seconds": -5}, {"seconds": "soon"}]
+    )
+    async def test_rejects_bad_duration(self, app, bad):
+        from pydoover import rpc
+
+        with pytest.raises(rpc.RPCError) as excinfo:
+            await app.rpc_countdown(None, bad)
+        assert excinfo.value.code == "INVALID_PARAMS"
+
+    async def test_rejects_bad_colour_before_starting(self, app):
+        from pydoover import rpc
+
+        with pytest.raises(rpc.RPCError):
+            await app.rpc_countdown(None, {"seconds": 60, "colour": "puce"})
+        assert app.status()["counting_down"] is False

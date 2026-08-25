@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 
 from pydoover import rpc
@@ -76,6 +77,11 @@ class SMI2MApplication(Application):
         self._written: dict[int, list[int]] = {}
 
         self._expires_at: float | None = None
+        # An active countdown: the monotonic deadline plus its presentation.
+        # Held here rather than as a background task so it shares the main
+        # loop's cadence and cannot outlive a blank or a new value.
+        self._countdown_ends_at: float | None = None
+        self._countdown_opts: dict = {}
         self._display_text = ""
         self._colour = parse_colour(self.config.default_colour.value)
         self._blink = False
@@ -97,6 +103,9 @@ class SMI2MApplication(Application):
 
     async def main_loop(self):
         now = time.monotonic()
+
+        if self._countdown_ends_at is not None:
+            await self._tick_countdown(now)
 
         if self._expires_at is not None and now >= self._expires_at:
             log.info("Display value expired after its timeout; blanking")
@@ -222,6 +231,57 @@ class SMI2MApplication(Application):
         # 0 means "leave it up" — the configured default and an explicit 0
         # agree on that, so a permanent sign is just blank_timeout=0.
         self._expires_at = time.monotonic() + timeout if timeout > 0 else None
+
+    # -----------------------------------------------------------------
+    # Countdown
+    # -----------------------------------------------------------------
+
+    async def _tick_countdown(self, now: float):
+        """Advance an active countdown by one loop.
+
+        The remaining time is recomputed from the deadline every tick rather
+        than decremented, so a slow loop or a missed Modbus write loses a frame
+        instead of desynchronising the clock from real time — a sign counting
+        down to something physical must not drift.
+        """
+        remaining = self._countdown_ends_at - now
+        opts = self._countdown_opts
+
+        if remaining <= 0:
+            self._countdown_ends_at = None
+            self._countdown_opts = {}
+            if opts.get("blank_at_zero", True):
+                await self._blank()
+            else:
+                await self._apply(0, opts)
+            return
+
+        # Ceiling, so the sign reads "1" for the whole final second and hits
+        # zero exactly when the time is actually up.
+        await self._apply(math.ceil(remaining), opts)
+
+    async def _apply(self, seconds: int, opts: dict):
+        colour = self._countdown_colour(seconds, opts)
+        try:
+            await self.show(seconds, colour=colour, timeout=None, decimals=0)
+        except (ValueError, RuntimeError) as exc:
+            # A dropped write is not worth ending the countdown over; the next
+            # tick a second later re-asserts the value anyway.
+            log.debug("Countdown tick failed: %s", exc)
+
+    @staticmethod
+    def _countdown_colour(seconds: int, opts: dict):
+        critical, warn = opts.get("critical_at"), opts.get("warn_at")
+        if critical is not None and seconds <= critical:
+            return Colour.RED
+        if warn is not None and seconds <= warn:
+            return Colour.YELLOW
+        return opts.get("colour")
+
+    def _cancel_countdown(self):
+        """Stop any countdown. Called whenever something else claims the panel."""
+        self._countdown_ends_at = None
+        self._countdown_opts = {}
 
     # -----------------------------------------------------------------
     # Modbus
@@ -452,6 +512,12 @@ class SMI2MApplication(Application):
             "blink": self._blink,
             "brightness": self._brightness,
             "blanks_in": remaining,
+            "counting_down": self._countdown_ends_at is not None,
+            "countdown_remaining": (
+                None
+                if self._countdown_ends_at is None
+                else max(0, math.ceil(self._countdown_ends_at - time.monotonic()))
+            ),
             "comms_ok": bool(self.tags.comms_ok.get()),
         }
 
@@ -480,6 +546,8 @@ class SMI2MApplication(Application):
         if "value" not in payload:
             raise rpc.RPCError("INVALID_PARAMS", "'value' is required")
 
+        self._cancel_countdown()
+
         try:
             return await self.show(
                 payload["value"],
@@ -497,8 +565,63 @@ class SMI2MApplication(Application):
 
     @rpc.handler("blank", channel=DISPLAY_CONTROL_CHANNEL)
     async def rpc_blank(self, ctx, payload) -> dict:
-        """Blank the panel immediately and cancel any pending timeout."""
+        """Blank the panel immediately, cancelling any timeout or countdown."""
+        self._cancel_countdown()
         await self._blank()
+        return self.status()
+
+    @rpc.handler("countdown", channel=DISPLAY_CONTROL_CHANNEL)
+    async def rpc_countdown(self, ctx, payload: dict) -> dict:
+        """Count down to zero on the panel, one second at a time.
+
+        The caller fires this once and the display owns the clock from there,
+        rather than being fed a value every second: one message instead of
+        hundreds, and the count keeps time even if the caller is busy.
+
+        Payload::
+
+            {
+              "seconds": 300,        # required, > 0
+              "colour": "green",     # colour above any threshold
+              "warn_at": 60,         # yellow at or below this many seconds
+              "critical_at": 10,     # red at or below this many seconds
+              "blank_at_zero": true  # false leaves "0" showing
+            }
+
+        `blank` cancels it; so does any `set_value`.
+        """
+        if not isinstance(payload, dict):
+            raise rpc.RPCError("INVALID_PARAMS", "payload must be an object")
+        try:
+            seconds = float(payload["seconds"])
+        except (KeyError, TypeError, ValueError):
+            raise rpc.RPCError(
+                "INVALID_PARAMS", "'seconds' is required and must be a number"
+            )
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise rpc.RPCError("INVALID_PARAMS", "'seconds' must be greater than zero")
+
+        # Validate the colours up front, so a typo fails the call instead of
+        # surfacing a second later as a dead countdown mid-tick.
+        opts = {
+            "colour": payload.get("colour"),
+            "warn_at": payload.get("warn_at"),
+            "critical_at": payload.get("critical_at"),
+            "blank_at_zero": bool(payload.get("blank_at_zero", True)),
+        }
+        for key in ("colour",):
+            if opts[key] is not None:
+                try:
+                    parse_colour(opts[key])
+                except ValueError as exc:
+                    raise rpc.RPCError("INVALID_PARAMS", str(exc)) from exc
+
+        self._countdown_opts = opts
+        self._countdown_ends_at = time.monotonic() + seconds
+        # Show the first value now rather than after one loop, so the sign
+        # reacts the instant the pump starts.
+        await self._apply(math.ceil(seconds), opts)
+        log.info("Counting down from %ds", math.ceil(seconds))
         return self.status()
 
     @rpc.handler("set_colour", channel=DISPLAY_CONTROL_CHANNEL)

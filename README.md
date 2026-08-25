@@ -74,6 +74,27 @@ No `channel=` is needed: `rpc.call()` already defaults to `dv-rpc`. On the
 handler side the app states the channel explicitly, because registration only
 subscribes to a channel that is named.
 
+### `countdown`
+
+Counts down to zero on the panel, one second per step. Fire it **once** — the
+display owns the clock from there, so a five-minute countdown costs one message
+instead of three hundred, and it keeps time even if the caller is busy.
+
+```jsonc
+{
+  "seconds": 300,        // required, > 0
+  "colour": "green",     // colour above any threshold
+  "warn_at": 60,         // yellow at or below this many seconds
+  "critical_at": 10,     // red at or below this many seconds
+  "blank_at_zero": true  // false leaves "0" on the panel
+}
+```
+
+The remaining time is recomputed from the deadline on every tick rather than
+decremented, so a slow loop or a dropped Modbus write loses a frame instead of
+letting the sign drift away from real time. `blank` cancels a countdown, and so
+does any `set_value`.
+
 ### `blank`, `set_colour`, `get_status`
 
 - **`blank`** — turn the panel off now and cancel any pending timeout.
