@@ -11,6 +11,7 @@
             "modbus_interface"
         ],
         "image_name": "registry.doover.com/apps/smi2m_display:main",
-        "build_args": "--platform linux/amd64,linux/arm64"
+        "build_args": "--platform linux/amd64,linux/arm64",
+        "export_ui_command": "NO_EXPORT"
     }
 }
