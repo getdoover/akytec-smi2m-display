@@ -1,0 +1,35 @@
+[project]
+name = "akytec-smi2m-display"
+version = "0.1.0"
+description = "Drive an akYtec SMI2-M RS485 7-segment display over Modbus RTU"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydoover>=1.0.0a8",
+]
+
+[project.scripts]
+doover-app-run = "smi2m_display:main"
+export-config = "smi2m_display.app_config:export"
+export-ui = "smi2m_display.app_ui:export"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The distribution is named for the hardware; the import package is not.
+[tool.hatch.build.targets.wheel]
+packages = ["src/smi2m_display"]
+
+[dependency-groups]
+dev = [
+    "aiohttp>=3.11.18",
+    "grpcio>=1.71.0",
+    "protobuf>=6.30.2",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.26.0",
+    "requests>=2.32.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
