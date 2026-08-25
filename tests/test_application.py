@@ -136,15 +136,32 @@ class TestSetup:
         assert instance.tags.is_blank.get() is True
         assert (REG_VALUE_IMAGE, [0, 0]) in instance.modbus_iface.writes
 
-    async def test_safe_state_written_only_when_enabled(self):
-        off = make_app(safe_state_timeout=0)
-        await off.setup()
-        assert all(start < 4062 or start > 4066 for start, _ in off.modbus_iface.writes)
-
-        on = make_app(safe_state_timeout=30)
+    async def test_safe_state_armed_when_configured(self):
+        on = make_app(safe_state_timeout=60, resync_interval=30.0)
         await on.setup()
         # 4062..4066 collapse into a single coalesced write.
-        assert (4062, [30, 0, 0, int(Colour.RED), 0]) in on.modbus_iface.writes
+        assert (4062, [60, 0, 0, int(Colour.RED), 0]) in on.modbus_iface.writes
+
+    async def test_safe_state_disarmed_when_configured_zero(self):
+        off = make_app(safe_state_timeout=0)
+        await off.setup()
+        # Zero must be *written*, not skipped. Displays ship with an armed
+        # timeout in their own flash; skipping the write leaves it armed
+        # forever and the panel drops to its safe-state pattern between our
+        # writes, which reads as the app sending garbage.
+        assert (4062, [0, 0, 0, int(Colour.RED), 0]) in off.modbus_iface.writes
+
+    async def test_warns_when_failsafe_would_outpace_resync(self, caplog):
+        app = make_app(safe_state_timeout=1, resync_interval=30.0)
+        with caplog.at_level("WARNING"):
+            await app.setup()
+        assert "safe state" in caplog.text.lower()
+
+    async def test_no_warning_when_failsafe_outlasts_resync(self, caplog):
+        app = make_app(safe_state_timeout=60, resync_interval=30.0)
+        with caplog.at_level("WARNING"):
+            await app.setup()
+        assert "safe state" not in caplog.text.lower()
 
     async def test_never_writes_save_to_flash(self):
         instance = make_app(safe_state_timeout=30)

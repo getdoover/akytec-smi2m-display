@@ -121,6 +121,17 @@ Two independent timeouts are available, and they cover different failures:
   cases where nothing is left running to honour the first timeout. Off by
   default; set it if a stale number on this sign would be misleading.
 
+  **It must be longer than the resync interval.** The app refreshes the panel
+  every `resync_interval` seconds, so a failsafe shorter than that fires
+  between refreshes and the sign spends most of its life showing the
+  safe-state pattern — a row of dashes — flickering to the real value for an
+  instant after each write. The app logs a warning if you configure this.
+
+  Displays ship with a short timeout already armed (1 s is common), so the app
+  writes this setting on every startup **including the zero**. That is what
+  turns an inherited failsafe off; if the sign shows dashes with a healthy
+  bus, this is why.
+
 ## Configuration
 
 | Setting | Default | Notes |

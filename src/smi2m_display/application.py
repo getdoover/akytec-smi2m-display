@@ -300,10 +300,29 @@ class SMI2MApplication(Application):
         than value registers, and it still does not write Save-to-Flash: the
         setting is re-applied on every app start, which costs one write per
         boot instead of spending the panel's finite flash budget.
+
+        The setting is written **unconditionally**, including the disabling
+        zero. Skipping the write when the app wants it off would only ever arm
+        the failsafe and never disarm it: a display carrying an armed timeout
+        in its own flash (they ship with one) would keep it forever, and the
+        symptom is brutal to read — the panel shows the value for an instant
+        after each write and sits on the safe-state pattern in between, so it
+        looks like the app is writing garbage rather than like a failsafe
+        firing on schedule.
         """
         timeout = int(self.config.safe_state_timeout.value or 0)
-        if timeout <= 0:
-            return
+
+        # An armed failsafe shorter than the resync gap means the panel spends
+        # most of its life in the safe state, blanking between our writes.
+        resync = self.config.resync_interval.value
+        if timeout > 0 and resync and timeout <= resync:
+            log.warning(
+                "Safe state timeout (%ss) is not longer than the resync "
+                "interval (%ss): the display will fall back to its safe state "
+                "between writes. Raise the timeout or lower the resync.",
+                timeout,
+                resync,
+            )
 
         # These four registers happen to be contiguous (4062..4066), but naming
         # them individually and letting _coalesce merge the run keeps the
@@ -321,9 +340,12 @@ class SMI2MApplication(Application):
         }
         for start, values in self._coalesce(blocks):
             if not await self._write(start, values):
-                log.warning("Could not arm the display safe-state failsafe")
+                log.warning("Could not configure the display safe-state failsafe")
                 return
-        log.info("Display safe-state failsafe armed at %ds", timeout)
+        if timeout > 0:
+            log.info("Display safe-state failsafe armed at %ds", timeout)
+        else:
+            log.info("Display safe-state failsafe disabled")
 
     async def _read_flash_budget(self):
         try:

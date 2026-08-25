@@ -96,8 +96,11 @@ class SMI2MConfig(config.Schema):
         description=(
             "The display's own comms-loss failsafe: if it receives nothing for "
             "this many seconds it blanks itself, so a dead Doovit cannot leave "
-            "a stale number on the panel. 0 disables it. Max 60. Applying this "
-            "writes the display's config registers on startup."
+            "a stale number on the panel. Max 60. Applied on startup, and 0 is "
+            "written too, so this genuinely disables a failsafe the display "
+            "already had stored. Must be LONGER than the resync interval: set "
+            "it shorter and the panel falls back to its safe-state pattern "
+            "between our writes."
         ),
     )
 

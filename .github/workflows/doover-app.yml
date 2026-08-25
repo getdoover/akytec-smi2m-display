@@ -14,3 +14,5 @@ jobs:
   app:
     uses: getdoover/workflows/.github/workflows/app.yml@main
     secrets: inherit
+    with:
+      staging: true
