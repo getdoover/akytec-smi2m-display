@@ -5,7 +5,7 @@ description = "Drive an akYtec SMI2-M RS485 7-segment display over Modbus RTU"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "pydoover>=1.0.0a8",
+    "pydoover>=1.14.0",
 ]
 
 [project.scripts]
