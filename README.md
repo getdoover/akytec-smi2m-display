@@ -25,7 +25,13 @@ write of the 4100..4108 settings block plus one write of the value.
 
 ## RPC interface
 
-Channel: **`display_control`**
+This is a machine-only app — there is no site-page UI. Everything is driven by
+other apps over RPC, on **`dv-rpc`**: the platform-default channel that
+`rpc.call()` uses when a caller names no channel.
+
+Because that channel is shared with every other app on the device, and this app
+is `allow_many` (a device can run two signs), **pass `app_key` to address a
+specific display**. Without it, every installed copy answers the same call.
 
 ### `set_value`
 
@@ -60,9 +66,13 @@ await self.rpc.call(
         "colour": "red" if tank_level > 90 else "green",
         "timeout": 300,
     },
-    channel="display_control",
+    app_key=self.config.display_app_key.value,  # which sign to drive
 )
 ```
+
+No `channel=` is needed: `rpc.call()` already defaults to `dv-rpc`. On the
+handler side the app states the channel explicitly, because registration only
+subscribes to a channel that is named.
 
 ### `blank`, `set_colour`, `get_status`
 
@@ -138,7 +148,7 @@ out returns to the right value on its own.
 The obvious alternative — writing the config to flash so it survives a power
 cycle — is a trap. Flash is committed by writing register 5000, and the part
 has a finite write budget (the display reports what is left of it, surfaced as
-**Flash Cycles Remaining** in Diagnostics). An app that saved on every update
+the `flash_cycles_remaining` tag). An app that saved on every update
 would wear the display out. **This app never writes register 5000.**
 
 ### Byte order
@@ -163,8 +173,7 @@ box, 9600 8N1.
 
 ```bash
 uv run pytest tests -v   # unit tests
-uv run export-config     # write config_schema into doover_config.json
-uv run export-ui         # write ui_schema into doover_config.json
+uv run export-config     # regenerate the config schema locally
 ```
 
 The encoding tests assert against values read back from a physical SMI2-M, not

@@ -11,7 +11,6 @@ dependencies = [
 [project.scripts]
 doover-app-run = "smi2m_display:main"
 export-config = "smi2m_display.app_config:export"
-export-ui = "smi2m_display.app_ui:export"
 
 [build-system]
 requires = ["hatchling"]

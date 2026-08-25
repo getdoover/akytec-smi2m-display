@@ -1,12 +1,11 @@
 import logging
 import time
 
-from pydoover import rpc, ui
+from pydoover import rpc
 from pydoover.docker import Application
 
 from .app_config import SMI2MConfig
 from .app_tags import SMI2MTags
-from .app_ui import SMI2MUI
 from .smi2m_driver import (
     DISPLAY_BLOCK_START,
     HOLDING_REGISTER,
@@ -33,9 +32,14 @@ from .smi2m_driver import (
 
 log = logging.getLogger(__name__)
 
-#: Channel other apps address to drive the sign. Kept distinct from the UI
-#: command channel so an app-to-app call doesn't look like an operator action.
-DISPLAY_CONTROL_CHANNEL = "display_control"
+#: The platform-default RPC channel ("dv-rpc"), which is what `rpc.call()`
+#: targets when a caller names no channel. Handlers must state it explicitly:
+#: registration only subscribes to a channel that is named, so a handler left
+#: at channel=None is registered but never hears anything.
+#:
+#: Because this channel is shared with every other app on the device, callers
+#: should pass ``app_key`` to address a specific display — see the README.
+DISPLAY_CONTROL_CHANNEL = rpc.DEFAULT_CHANNEL
 
 #: Sentinel so ``timeout=None`` ("never expire") is distinguishable from
 #: "caller said nothing, use the configured default".
@@ -57,7 +61,6 @@ class SMI2MApplication(Application):
 
     config_cls = SMI2MConfig
     tags_cls = SMI2MTags
-    ui_cls = SMI2MUI
 
     config: SMI2MConfig
     tags: SMI2MTags
@@ -169,7 +172,7 @@ class SMI2MApplication(Application):
 
     @staticmethod
     def _render_number(value: float, decimal_point: int) -> str:
-        """Best-effort echo of what the panel now reads, for the UI tag."""
+        """Best-effort echo of what the panel now reads, for the status tag."""
         if decimal_point == 0 and float(value).is_integer():
             return str(int(value))
         return f"{value:.{decimal_point}f}" if decimal_point else str(value)
@@ -341,7 +344,7 @@ class SMI2MApplication(Application):
             await self.tags.flash_cycles_remaining.set(result)
 
     # -----------------------------------------------------------------
-    # Public entry point shared by RPC and UI
+    # Public entry point behind the RPC surface
     # -----------------------------------------------------------------
 
     async def show(
@@ -502,37 +505,3 @@ class SMI2MApplication(Application):
         """Report what the panel is showing and whether the bus is healthy."""
         await self._read_flash_budget()
         return self.status()
-
-    # -----------------------------------------------------------------
-    # UI handlers — manual control from the site page
-    # -----------------------------------------------------------------
-
-    @ui.handler("manual_message")
-    async def on_manual_message(self, ctx, value):
-        if value in (None, ""):
-            return
-        try:
-            await self.show(value)
-        except (ValueError, RuntimeError) as exc:
-            log.warning("Manual message failed: %s", exc)
-        await ctx.set_value(None)
-
-    @ui.handler("manual_colour")
-    async def on_manual_colour(self, ctx, value):
-        if not value:
-            return
-        try:
-            self._colour = parse_colour(value)
-        except ValueError as exc:
-            log.warning("Manual colour failed: %s", exc)
-            return
-        if DISPLAY_BLOCK_START in self._desired:
-            block = list(self._desired[DISPLAY_BLOCK_START])
-            block[0] = int(self._colour)
-            self._desired[DISPLAY_BLOCK_START] = block
-        await self._flush()
-
-    @ui.handler("blank_now")
-    async def on_blank_now(self, ctx, value):
-        await self._blank()
-        await ctx.set_value(None)
