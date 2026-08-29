@@ -18,6 +18,8 @@ from smi2m_display.smi2m_driver import (
     REG_VALUE_IMAGE,
     REG_VALUE_REAL,
     REG_VALUE_STRING,
+    REG_VALUE_TIME,
+    TIME_MAX_SECONDS,
     Colour,
     DataType,
     DisplayMode,
@@ -40,12 +42,7 @@ class FakeConfig:
             "default_colour": "green",
             "brightness": 75,
             "blank_timeout": 300.0,
-            "scroll_long_text": True,
-            "blink_period": 1000,
-            "scroll_tick": 200,
             "safe_state_timeout": 0,
-            "swap_words": False,
-            "swap_bytes": False,
             "resync_interval": 30.0,
         }
         defaults.update(overrides)
@@ -69,11 +66,9 @@ class FakeTags:
         "displayed_value",
         "displayed_colour",
         "is_blank",
-        "seconds_until_blank",
         "comms_ok",
         "last_error",
         "last_write_ts",
-        "flash_cycles_remaining",
     )
 
     def __init__(self):
@@ -139,8 +134,8 @@ class TestSetup:
     async def test_safe_state_armed_when_configured(self):
         on = make_app(safe_state_timeout=60, resync_interval=30.0)
         await on.setup()
-        # 4062..4066 collapse into a single coalesced write.
-        assert (4062, [60, 0, 0, int(Colour.RED), 0]) in on.modbus_iface.writes
+        # 4061..4066 collapse into a single coalesced write, byte order first.
+        assert (4061, [0, 60, 0, 0, int(Colour.RED), 0]) in on.modbus_iface.writes
 
     async def test_safe_state_disarmed_when_configured_zero(self):
         off = make_app(safe_state_timeout=0)
@@ -149,7 +144,7 @@ class TestSetup:
         # timeout in their own flash; skipping the write leaves it armed
         # forever and the panel drops to its safe-state pattern between our
         # writes, which reads as the app sending garbage.
-        assert (4062, [0, 0, 0, int(Colour.RED), 0]) in off.modbus_iface.writes
+        assert (4061, [0, 0, 0, 0, int(Colour.RED), 0]) in off.modbus_iface.writes
 
     async def test_warns_when_failsafe_would_outpace_resync(self, caplog):
         app = make_app(safe_state_timeout=1, resync_interval=30.0)
@@ -217,12 +212,6 @@ class TestShowText:
     async def test_long_text_scrolls(self, app):
         await app.show("LEVEL HIGH")
         assert app.modbus_iface.block()[MODE_IDX] == DisplayMode.TEXT_TICKER
-
-    async def test_scrolling_can_be_disabled(self):
-        instance = make_app(scroll_long_text=False)
-        await instance.setup()
-        await instance.show("LEVEL HIGH")
-        assert instance.modbus_iface.block()[MODE_IDX] == DisplayMode.STATIC
 
 
 class TestColourAndStyle:
@@ -409,25 +398,25 @@ class TestRPC:
         result = await app.rpc_set_colour(None, "red")
         assert result["colour"] == "red"
 
-    async def test_get_status_reads_flash_budget(self, app):
-        await app.rpc_get_status(None, {})
-        assert app.tags.flash_cycles_remaining.get() == 99
+    async def test_get_status_reports_the_panel_state(self, app):
+        await app.show(42)
+        assert (await app.rpc_get_status(None, {}))["displayed"] == "42"
 
 
 class TestCountdown:
     async def test_shows_the_first_value_immediately(self, app):
         result = await app.rpc_countdown(None, {"seconds": 300})
         assert result["counting_down"] is True
-        assert result["displayed"] == "300"
+        assert result["displayed"] == "05:00"
         # Fired the instant the pump starts, not one loop later.
-        assert dict(app.modbus_iface.pop())[REG_VALUE_REAL] is not None
+        assert dict(app.modbus_iface.pop())[REG_VALUE_TIME] is not None
 
     async def test_counts_down_on_each_tick(self, app):
         await app.rpc_countdown(None, {"seconds": 300})
         app._countdown_ends_at = time.monotonic() + 120.4
         await app.main_loop()
-        # Ceiling: the sign reads 121 until the 121st second is fully gone.
-        assert app.status()["displayed"] == "121"
+        # Ceiling: the sign reads 2:01 until the 121st second is fully gone.
+        assert app.status()["displayed"] == "02:01"
 
     async def test_recomputed_from_deadline_not_decremented(self, app):
         await app.rpc_countdown(None, {"seconds": 300})
@@ -436,7 +425,7 @@ class TestCountdown:
         await app.main_loop()
         await app.main_loop()
         # Three ticks, but only real time advances the count — no drift.
-        assert app.status()["displayed"] == "10"
+        assert app.status()["displayed"] == "00:10"
 
     async def test_blanks_at_zero(self, app):
         await app.rpc_countdown(None, {"seconds": 5})
@@ -449,7 +438,7 @@ class TestCountdown:
         await app.rpc_countdown(None, {"seconds": 5, "blank_at_zero": False})
         app._countdown_ends_at = time.monotonic() - 0.01
         await app.main_loop()
-        assert app.status()["displayed"] == "0"
+        assert app.status()["displayed"] == "00:00"
         assert app.tags.is_blank.get() is False
 
     async def test_colour_thresholds(self, app):
@@ -494,7 +483,35 @@ class TestCountdown:
         assert app.status()["counting_down"] is True
         app.modbus_iface.fail = False
         await app.main_loop()
-        assert app.status()["displayed"] == "100"
+        assert app.status()["displayed"] == "01:40"
+
+    async def test_uses_the_panel_time_type_not_a_bare_number(self, app):
+        """MM:SS comes from data type 7 and register 4252, not from us."""
+        await app.rpc_countdown(None, {"seconds": 1200})
+        written = dict(app.modbus_iface.pop())
+        assert written[DISPLAY_BLOCK_START][TYPE_IDX] == int(DataType.TIME)
+        # 1200 raw seconds; the display does the /60 itself.
+        assert written[REG_VALUE_TIME] == [0, 1200]
+        assert app.status()["displayed"] == "20:00"
+
+    async def test_as_time_false_keeps_a_bare_second_count(self, app):
+        await app.rpc_countdown(None, {"seconds": 300, "as_time": False})
+        assert app.status()["displayed"] == "300"
+        assert REG_VALUE_REAL in dict(app.modbus_iface.pop())
+
+    async def test_rejects_a_count_too_long_for_mm_ss(self, app):
+        from pydoover import rpc
+
+        with pytest.raises(rpc.RPCError) as excinfo:
+            await app.rpc_countdown(None, {"seconds": TIME_MAX_SECONDS + 1})
+        assert excinfo.value.code == "INVALID_PARAMS"
+        assert app.status()["counting_down"] is False
+
+    async def test_a_long_count_is_allowed_as_raw_seconds(self, app):
+        result = await app.rpc_countdown(
+            None, {"seconds": TIME_MAX_SECONDS + 1, "as_time": False}
+        )
+        assert result["counting_down"] is True
 
     @pytest.mark.parametrize(
         "bad", [{}, {"seconds": 0}, {"seconds": -5}, {"seconds": "soon"}]

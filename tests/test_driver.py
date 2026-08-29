@@ -11,16 +11,18 @@ from smi2m_display.smi2m_driver import (
     DISPLAY_MAX,
     DISPLAY_MIN,
     STRING_REGISTERS,
+    TIME_MAX_SECONDS,
     Colour,
     DataType,
     DisplayMode,
     decimal_point_for,
     float_to_registers,
-    int16_to_register,
+    format_time,
     integer_digits,
     parse_colour,
     sanitise_string,
     string_to_registers,
+    time_fits,
     uint32_to_registers,
     value_fits,
 )
@@ -31,13 +33,6 @@ class TestFloatEncoding:
         # Confirmed on device: writing 123.4 to register 4206 reads back as
         # [17142, 52429], i.e. most-significant word first.
         assert float_to_registers(123.4) == [17142, 52429]
-
-    def test_swap_words_reverses_register_order(self):
-        assert float_to_registers(123.4, swap_words=True) == [52429, 17142]
-
-    def test_swap_bytes_swaps_within_each_register(self):
-        # 123.4 is 0x42F6CCCD; byte-swapping each register gives 0xF642, 0xCDCC.
-        assert float_to_registers(123.4, swap_bytes=True) == [0xF642, 0xCDCC]
 
     def test_zero(self):
         assert float_to_registers(0.0) == [0, 0]
@@ -60,14 +55,6 @@ class TestIntegerEncoding:
     def test_uint32_range_enforced(self):
         with pytest.raises(ValueError):
             uint32_to_registers(0x1_0000_0000)
-
-    def test_int16_twos_complement(self):
-        assert int16_to_register(-1) == 0xFFFF
-        assert int16_to_register(1234) == 1234
-
-    def test_int16_range_enforced(self):
-        with pytest.raises(ValueError):
-            int16_to_register(40000)
 
 
 class TestStringEncoding:
@@ -93,10 +80,6 @@ class TestStringEncoding:
     def test_length_clamped_to_maximum(self):
         _, length = string_to_registers("X" * 100)
         assert length == 32
-
-    def test_swap_bytes(self):
-        registers, _ = string_to_registers("AB", swap_bytes=True)
-        assert registers[0] == (ord("B") << 8) | ord("A")
 
 
 class TestSanitise:
@@ -188,3 +171,41 @@ class TestRegisterConstants:
             DisplayMode.TEXT_TICKER,
             DisplayMode.NUMBER_TICKER,
         ) == (0, 1, 2)
+
+
+class TestTimeFormat:
+    """MM:SS rendering for data type 7.
+
+    Unlike the rest of this file these expectations come from the manual
+    (Table 4.7 footnote 3) rather than from a bench check, because the panel
+    does the division itself — we only mirror it for the status tag.
+    """
+
+    def test_matches_the_manual_worked_example(self):
+        # "If N = 1000, 16:40 is displayed."
+        assert format_time(1000) == "16:40"
+
+    @pytest.mark.parametrize(
+        "seconds,expected",
+        [
+            (0, "00:00"),
+            (9, "00:09"),
+            (60, "01:00"),
+            (120, "02:00"),
+            (1200, "20:00"),
+            (TIME_MAX_SECONDS, "99:59"),
+        ],
+    )
+    def test_renders_by_integer_division(self, seconds, expected):
+        assert format_time(seconds) == expected
+
+    def test_range_stops_at_the_panel_limit(self):
+        assert time_fits(TIME_MAX_SECONDS)
+        # Above this the display shows ErrH rather than wrapping (Table 4.11).
+        assert not time_fits(TIME_MAX_SECONDS + 1)
+        assert not time_fits(-1)
+
+    @pytest.mark.parametrize("bad", [-1, TIME_MAX_SECONDS + 1])
+    def test_rejects_out_of_range(self, bad):
+        with pytest.raises(ValueError):
+            format_time(bad)

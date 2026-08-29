@@ -30,6 +30,10 @@ in `application.py`.
 - **Never write register 5000 (Save-to-Flash).** Display config is RAM-only by
   design here; flash has a finite write budget. The resync loop, not flash,
   is what survives a display power cycle.
+- **The display has no timer.** `countdown` is driven entirely by the app's
+  1 Hz loop; data type 7 (`TIME`, register 4252) only *formats* a raw second
+  count as MM:SS, capped at 5999 s (99:59) before the panel shows `ErrH`.
+  Firing the RPC once saves messages, not bus traffic.
 - **Blanking is an IMAGE write of bitmask 0**, not a value write — there is no
   off register, and writing `0` would show a literal zero.
 - **Strings are always 16 registers.** In SLAVE mode the display rejects

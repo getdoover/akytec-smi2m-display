@@ -43,7 +43,8 @@ specific display**. Without it, every installed copy answers the same call.
   "decimals": 1,      // 0..3; omitted = fitted automatically
   "blink": false,
   "brightness": 75,   // 0..100 %
-  "as_text": false    // force "0012" to render as text, not the number 12
+  "as_text": false,   // force "0012" to render as text, not the number 12
+  "as_time": false    // read "value" as seconds and show it as MM:SS
 }
 ```
 
@@ -76,19 +77,30 @@ subscribes to a channel that is named.
 
 ### `countdown`
 
-Counts down to zero on the panel, one second per step. Fire it **once** — the
-display owns the clock from there, so a five-minute countdown costs one message
-instead of three hundred, and it keeps time even if the caller is busy.
+Counts down to zero on the panel as **MM:SS**, one second per step. Fire it
+**once** — the app owns the clock from there, so a five-minute countdown costs
+one RPC message instead of three hundred, and it keeps time even if the caller
+is busy.
 
 ```jsonc
 {
-  "seconds": 300,        // required, > 0
+  "seconds": 300,        // required, > 0 (max 5999 — see below)
   "colour": "green",     // colour above any threshold
   "warn_at": 60,         // yellow at or below this many seconds
   "critical_at": 10,     // red at or below this many seconds
-  "blank_at_zero": true  // false leaves "0" on the panel
+  "blank_at_zero": true, // false leaves "00:00" on the panel
+  "as_time": true        // false counts raw seconds instead of MM:SS
 }
 ```
+
+The MM:SS split is the display's own: data type 7 (`TIME`) takes a raw second
+count in register 4252 and renders `N / 60` and `N % 60` itself. That caps a
+MM:SS countdown at **5999 s (99:59)**; a longer one is rejected, and
+`as_time: false` is the way to count raw seconds past that.
+
+The panel has **no timer of its own** — `TIME` is a formatting mode, not a
+clock, so the app still writes a new value every second at its 1 Hz loop. What
+firing once saves is RPC traffic, not bus traffic.
 
 The remaining time is recomputed from the deadline on every tick rather than
 decremented, so a slow loop or a dropped Modbus write loses a frame instead of
@@ -162,12 +174,11 @@ Two independent timeouts are available, and they cover different failures:
 | Default Colour | green | Used when a call names no colour |
 | Brightness | 75 % | |
 | Blank Timeout | 300 s | 0 leaves values up indefinitely |
-| Scroll Long Text | on | |
-| Blink Period | 1000 ms | |
-| Scroll Speed | 200 ms/char | |
 | Safe State Timeout | 0 (off) | Display's own comms-loss failsafe, max 60 s |
 | Resync Interval | 30 s | Re-asserts display state; recovers a power-cycled panel |
-| Swap Word Order / Swap Bytes | off | Only for a display with a non-default byte order saved in flash |
+
+Blink period (1000 ms), scroll speed (200 ms/char) and byte order are fixed in
+code rather than exposed as settings — see below for the last of those.
 
 ### Why there is a resync
 
@@ -179,20 +190,23 @@ out returns to the right value on its own.
 
 The obvious alternative — writing the config to flash so it survives a power
 cycle — is a trap. Flash is committed by writing register 5000, and the part
-has a finite write budget (the display reports what is left of it, surfaced as
-the `flash_cycles_remaining` tag). An app that saved on every update
-would wear the display out. **This app never writes register 5000.**
+has a finite write budget (the display reports what is left of it at register
+61624). An app that saved on every update would wear the display out. **This
+app never writes register 5000.**
 
 ### Byte order
 
-The defaults are correct for a factory-default display and were confirmed on
-hardware: 32-bit values go most-significant word first, and strings pack two
-characters per register with the first character in the high byte. The two
-swap options exist only for a display previously commissioned with a
-non-default **Byte order** parameter saved in its flash — cheaper than
-re-flashing the display to run this app. Symptoms: numbers appear as wild or
-tiny values (try Swap Word Order), or text renders as scrambled character
-pairs (try Swap Bytes).
+The encoding is plain big-endian, confirmed on hardware: 32-bit values go
+most-significant word first, and strings pack two characters per register with
+the first character in the high byte.
+
+A display commissioned by someone else may carry a non-default **Byte order**
+(register 4061) in its flash, which would garble all of that. Rather than
+offering a pair of swap settings for the operator to guess at, the app **writes
+4061 = UNCHANGED at startup**, next to the safe-state configuration. The write
+lands whatever order the panel was carrying, because every value in that frame
+is either a single register or zero, and zero is invariant under all four
+orderings.
 
 ## Wiring
 

@@ -10,7 +10,7 @@ from .app_tags import SMI2MTags
 from .smi2m_driver import (
     DISPLAY_BLOCK_START,
     HOLDING_REGISTER,
-    REG_FLASH_CYCLES_REMAINING,
+    REG_BYTE_ORDER,
     REG_SAFE_STATE_BITMASK,
     REG_SAFE_STATE_BLINKING,
     REG_SAFE_STATE_COLOUR,
@@ -19,14 +19,18 @@ from .smi2m_driver import (
     REG_VALUE_IMAGE,
     REG_VALUE_REAL,
     REG_VALUE_STRING,
+    REG_VALUE_TIME,
+    TIME_MAX_SECONDS,
     Colour,
     DataType,
     DisplayMode,
     decimal_point_for,
     float_to_registers,
+    format_time,
     parse_colour,
     sanitise_string,
     string_to_registers,
+    time_fits,
     uint32_to_registers,
     value_fits,
 )
@@ -48,6 +52,13 @@ _UNSET = object()
 
 #: Segment bitmask that lights nothing — see the module docstring in the driver.
 BLANK_IMAGE = 0
+
+#: Blink period (register 4103) in ms. The panel's own default, and legible.
+BLINK_PERIOD_MS = 1000
+
+#: Scroll step (register 4105) in ms, for text too long for the four digits.
+#: 200 ms per character is comfortable to read from across a yard.
+SCROLL_TICK_MS = 200
 
 
 class SMI2MApplication(Application):
@@ -90,7 +101,7 @@ class SMI2MApplication(Application):
         # startup rather than on the very first tick.
         self._last_resync = time.monotonic()
 
-        await self._apply_safe_state_config()
+        await self._apply_device_config()
 
         # Start from a known state rather than inheriting whatever the panel
         # was left showing by a previous run or another master.
@@ -127,12 +138,6 @@ class SMI2MApplication(Application):
         await self.tags.displayed_colour.set(self._colour.name.lower())
         await self.tags.is_blank.set(self._display_text == "")
 
-        if self._expires_at is None:
-            remaining = -1.0
-        else:
-            remaining = max(0.0, self._expires_at - time.monotonic())
-        await self.tags.seconds_until_blank.set(round(remaining, 1))
-
     # -----------------------------------------------------------------
     # Display state
     # -----------------------------------------------------------------
@@ -151,9 +156,9 @@ class SMI2MApplication(Application):
             int(self._colour),  # 4100 colour
             max(0, min(100, int(self._brightness))),  # 4101 brightness
             1 if self._blink else 0,  # 4102 blinking
-            int(self.config.blink_period.value),  # 4103 blink period
+            BLINK_PERIOD_MS,  # 4103 blink period
             0,  # 4104 leading zeros
-            int(self.config.scroll_tick.value),  # 4105 tick time
+            SCROLL_TICK_MS,  # 4105 tick time
             int(mode),  # 4106 display mode
             int(data_type),  # 4107 data type
             int(decimal_point),  # 4108 decimal point
@@ -170,12 +175,9 @@ class SMI2MApplication(Application):
             mode = DisplayMode.NUMBER_TICKER
             dp = 0 if decimals is None else max(0, min(3, int(decimals)))
 
-        swap_w = self.config.swap_words.value
-        swap_b = self.config.swap_bytes.value
-
         self._desired = {
             DISPLAY_BLOCK_START: self._display_block(DataType.REAL, mode, dp),
-            REG_VALUE_REAL: float_to_registers(value, swap_w, swap_b),
+            REG_VALUE_REAL: float_to_registers(value),
         }
         self._display_text = self._render_number(value, dp)
 
@@ -188,16 +190,41 @@ class SMI2MApplication(Application):
 
     def _show_text(self, text: str):
         cleaned = sanitise_string(text)
-        scroll = self.config.scroll_long_text.value and len(cleaned.strip()) > 4
-        mode = DisplayMode.TEXT_TICKER if scroll else DisplayMode.STATIC
+        # Anything wider than the four digits scrolls; the alternative is
+        # showing the first four characters and silently losing the rest.
+        mode = (
+            DisplayMode.TEXT_TICKER if len(cleaned.strip()) > 4 else DisplayMode.STATIC
+        )
 
-        registers, length = string_to_registers(cleaned, self.config.swap_bytes.value)
+        registers, length = string_to_registers(cleaned)
         self._desired = {
             DISPLAY_BLOCK_START: self._display_block(DataType.STRING, mode, 0),
             REG_VALUE_STRING: registers,
             REG_STRING_LENGTH: [length],
         }
         self._display_text = cleaned
+
+    def _show_time(self, seconds: int):
+        """Show a second count as MM:SS using the panel's TIME data type.
+
+        The display does the MM:SS split itself from the raw seconds in
+        register 4252 — it is a rendering mode, not a timer, so this still has
+        to be called with a fresh value for every second that elapses.
+        """
+        seconds = int(seconds)
+        if not time_fits(seconds):
+            raise ValueError(
+                f"{seconds}s cannot be shown as MM:SS; the panel's TIME range "
+                f"is 0..{TIME_MAX_SECONDS} seconds (99:59)"
+            )
+
+        self._desired = {
+            DISPLAY_BLOCK_START: self._display_block(
+                DataType.TIME, DisplayMode.STATIC, 0
+            ),
+            REG_VALUE_TIME: uint32_to_registers(seconds),
+        }
+        self._display_text = format_time(seconds)
 
     async def _blank(self):
         """Turn every segment off.
@@ -209,11 +236,7 @@ class SMI2MApplication(Application):
             DISPLAY_BLOCK_START: self._display_block(
                 DataType.IMAGE, DisplayMode.STATIC, 0
             ),
-            REG_VALUE_IMAGE: uint32_to_registers(
-                BLANK_IMAGE,
-                self.config.swap_words.value,
-                self.config.swap_bytes.value,
-            ),
+            REG_VALUE_IMAGE: uint32_to_registers(BLANK_IMAGE),
         }
         self._display_text = ""
         self._expires_at = None
@@ -263,7 +286,13 @@ class SMI2MApplication(Application):
     async def _apply(self, seconds: int, opts: dict):
         colour = self._countdown_colour(seconds, opts)
         try:
-            await self.show(seconds, colour=colour, timeout=None, decimals=0)
+            await self.show(
+                seconds,
+                colour=colour,
+                timeout=None,
+                decimals=0,
+                as_time=opts.get("as_time", True),
+            )
         except (ValueError, RuntimeError) as exc:
             # A dropped write is not worth ending the countdown over; the next
             # tick a second later re-asserts the value anyway.
@@ -353,8 +382,8 @@ class SMI2MApplication(Application):
         await self.tags.comms_ok.set(False)
         await self.tags.last_error.set(message[:200])
 
-    async def _apply_safe_state_config(self):
-        """Configure the display's own comms-loss failsafe, if asked for.
+    async def _apply_device_config(self):
+        """Pin the panel's byte order and configure its comms-loss failsafe.
 
         This is the only place the app touches configuration registers rather
         than value registers, and it still does not write Save-to-Flash: the
@@ -384,46 +413,33 @@ class SMI2MApplication(Application):
                 resync,
             )
 
-        # These four registers happen to be contiguous (4062..4066), but naming
+        # These five registers happen to be contiguous (4061..4066), but naming
         # them individually and letting _coalesce merge the run keeps the
         # offsets honest against the datasheet instead of hiding them in
         # index arithmetic.
+        #
+        # Byte order goes first and is pinned to UNCHANGED, which is what lets
+        # every encoder in the driver assume plain big-endian ordering instead
+        # of carrying a pair of "my numbers look wild" config toggles. A panel
+        # commissioned by someone else may have a swapped order in its flash,
+        # and that would garble this very frame — except that every value in it
+        # is either a single register or zero, and zero is invariant under all
+        # four orderings.
         blocks = {
+            REG_BYTE_ORDER: [0],
             REG_SAFE_STATE_TIMEOUT: [timeout],
-            REG_SAFE_STATE_BITMASK: uint32_to_registers(
-                BLANK_IMAGE,
-                self.config.swap_words.value,
-                self.config.swap_bytes.value,
-            ),
+            REG_SAFE_STATE_BITMASK: uint32_to_registers(BLANK_IMAGE),
             REG_SAFE_STATE_COLOUR: [int(Colour.RED)],
             REG_SAFE_STATE_BLINKING: [0],
         }
         for start, values in self._coalesce(blocks):
             if not await self._write(start, values):
-                log.warning("Could not configure the display safe-state failsafe")
+                log.warning("Could not write the display's startup configuration")
                 return
         if timeout > 0:
             log.info("Display safe-state failsafe armed at %ds", timeout)
         else:
             log.info("Display safe-state failsafe disabled")
-
-    async def _read_flash_budget(self):
-        try:
-            result = await self.modbus_iface.read_registers(
-                modbus_id=self.config.slave_id.value,
-                start_address=REG_FLASH_CYCLES_REMAINING,
-                num_registers=1,
-                register_type=HOLDING_REGISTER,
-            )
-        except Exception as exc:  # noqa: BLE001 - see below
-            # Deliberately broad: this is a diagnostics-only read, and the
-            # modbus interface surfaces transport, gRPC and device faults as
-            # unrelated exception types. Narrowing it would let an unlisted one
-            # fail the RPC that merely asked for status.
-            log.debug("Could not read flash budget: %s", exc)
-            return
-        if isinstance(result, int):
-            await self.tags.flash_cycles_remaining.set(result)
 
     # -----------------------------------------------------------------
     # Public entry point behind the RPC surface
@@ -438,8 +454,13 @@ class SMI2MApplication(Application):
         blink: bool | None = None,
         brightness: int | None = None,
         as_text: bool | None = None,
+        as_time: bool | None = None,
     ) -> dict:
-        """Put *value* on the panel. Raises ValueError on unusable input."""
+        """Put *value* on the panel. Raises ValueError on unusable input.
+
+        With *as_time*, *value* is a number of seconds and is rendered MM:SS by
+        the panel's TIME data type rather than as a bare four-digit number.
+        """
         if colour is not None:
             self._colour = parse_colour(colour)
         if blink is not None:
@@ -448,7 +469,11 @@ class SMI2MApplication(Application):
             self._brightness = max(0, min(100, int(brightness)))
 
         number = None if as_text else self._as_number(value)
-        if number is None:
+        if as_time:
+            if number is None:
+                raise ValueError(f"cannot show {value!r} as a time")
+            self._show_time(round(number))
+        elif number is None:
             if value is None:
                 raise ValueError("no value given")
             self._show_text(str(value))
@@ -538,7 +563,8 @@ class SMI2MApplication(Application):
               "decimals": 1,          # 0..3, else fitted automatically
               "blink": false,
               "brightness": 75,       # 0..100 %
-              "as_text": false        # force text rendering of a numeric string
+              "as_text": false,       # force text rendering of a numeric string
+              "as_time": false        # read 'value' as seconds, show MM:SS
             }
         """
         if not isinstance(payload, dict):
@@ -557,6 +583,7 @@ class SMI2MApplication(Application):
                 blink=payload.get("blink"),
                 brightness=payload.get("brightness"),
                 as_text=payload.get("as_text"),
+                as_time=payload.get("as_time"),
             )
         except ValueError as exc:
             raise rpc.RPCError("INVALID_PARAMS", str(exc)) from exc
@@ -574,9 +601,15 @@ class SMI2MApplication(Application):
     async def rpc_countdown(self, ctx, payload: dict) -> dict:
         """Count down to zero on the panel, one second at a time.
 
-        The caller fires this once and the display owns the clock from there,
+        The caller fires this once and the app owns the clock from there,
         rather than being fed a value every second: one message instead of
-        hundreds, and the count keeps time even if the caller is busy.
+        hundreds, and the count keeps time even if the caller is busy. The
+        panel itself has no timer — the app still writes each new value at its
+        1 Hz loop — so what this saves is RPC traffic, not bus traffic.
+
+        The count shows as MM:SS via the display's TIME data type, which caps
+        it at 99:59. Pass ``as_time: false`` for a bare count of seconds, which
+        is the only way to count down from longer than that.
 
         Payload::
 
@@ -585,7 +618,8 @@ class SMI2MApplication(Application):
               "colour": "green",     # colour above any threshold
               "warn_at": 60,         # yellow at or below this many seconds
               "critical_at": 10,     # red at or below this many seconds
-              "blank_at_zero": true  # false leaves "0" showing
+              "blank_at_zero": true, # false leaves "00:00" showing
+              "as_time": true        # false counts raw seconds instead
             }
 
         `blank` cancels it; so does any `set_value`.
@@ -608,7 +642,18 @@ class SMI2MApplication(Application):
             "warn_at": payload.get("warn_at"),
             "critical_at": payload.get("critical_at"),
             "blank_at_zero": bool(payload.get("blank_at_zero", True)),
+            "as_time": bool(payload.get("as_time", True)),
         }
+
+        # Reject an over-long MM:SS count here rather than letting the first
+        # tick fail: the panel would show ErrH (out of range, Table 4.11) for
+        # the whole of the count above 99:59, which reads as a broken sign.
+        if opts["as_time"] and not time_fits(math.ceil(seconds)):
+            raise rpc.RPCError(
+                "INVALID_PARAMS",
+                f"'seconds' must be at most {TIME_MAX_SECONDS} (99:59) to show "
+                f"as MM:SS; pass as_time=false to count raw seconds",
+            )
         for key in ("colour",):
             if opts[key] is not None:
                 try:
@@ -621,7 +666,12 @@ class SMI2MApplication(Application):
         # Show the first value now rather than after one loop, so the sign
         # reacts the instant the pump starts.
         await self._apply(math.ceil(seconds), opts)
-        log.info("Counting down from %ds", math.ceil(seconds))
+        log.info(
+            "Counting down from %s",
+            format_time(math.ceil(seconds))
+            if opts["as_time"]
+            else f"{math.ceil(seconds)}s",
+        )
         return self.status()
 
     @rpc.handler("set_colour", channel=DISPLAY_CONTROL_CHANNEL)
@@ -648,5 +698,4 @@ class SMI2MApplication(Application):
     @rpc.handler("get_status", channel=DISPLAY_CONTROL_CHANNEL)
     async def rpc_get_status(self, ctx, payload) -> dict:
         """Report what the panel is showing and whether the bus is healthy."""
-        await self._read_flash_budget()
         return self.status()

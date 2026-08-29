@@ -54,37 +54,6 @@ class SMI2MConfig(config.Schema):
         ),
     )
 
-    scroll_long_text = config.Boolean(
-        "Scroll Long Text",
-        name="scroll_long_text",
-        default=True,
-        description=(
-            "Show strings longer than 4 characters by scrolling them across "
-            "the panel. With this off, only the first 4 characters are shown."
-        ),
-    )
-
-    blink_period = config.Integer(
-        "Blink Period",
-        name="blink_period",
-        default=1000,
-        minimum=250,
-        maximum=3000,
-        description="Blink period in milliseconds, when blinking is requested.",
-    )
-
-    scroll_tick = config.Integer(
-        "Scroll Speed",
-        name="scroll_tick",
-        default=200,
-        minimum=100,
-        maximum=1500,
-        description=(
-            "Milliseconds per character step when scrolling. Lower is faster; "
-            "200 ms is comfortable to read from a distance."
-        ),
-    )
-
     # -- hardware failsafe ---------------------------------------------
 
     safe_state_timeout = config.Integer(
@@ -104,28 +73,7 @@ class SMI2MConfig(config.Schema):
         ),
     )
 
-    # -- advanced ------------------------------------------------------
-
-    swap_words = config.Boolean(
-        "Swap 32-bit Word Order",
-        name="swap_words",
-        default=False,
-        description=(
-            "Advanced. Only needed if the display has a non-default 'Byte "
-            "order' parameter saved in its flash. Symptom: numbers appear as "
-            "wild or tiny values."
-        ),
-    )
-
-    swap_bytes = config.Boolean(
-        "Swap Bytes Within Registers",
-        name="swap_bytes",
-        default=False,
-        description=(
-            "Advanced. Companion to the above, for a display configured with "
-            "byte swapping. Symptom: text renders as scrambled character pairs."
-        ),
-    )
+    # -- resync --------------------------------------------------------
 
     resync_interval = config.Number(
         "Resync Interval",

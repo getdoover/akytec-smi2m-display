@@ -52,6 +52,10 @@ REG_SAVE_TO_FLASH = 5000  # ENUM2: writing 1 commits RAM config to flash
 
 # -- Modbus common --
 REG_BYTE_ORDER = 4061  # ENUM4: 0 unchanged, 1 swap bytes, 2 swap regs, 3 both
+#: Written as 0 (UNCHANGED) at startup so the encoders above can assume plain
+#: big-endian ordering rather than carrying a pair of config toggles. Zero is
+#: invariant under every swap the display can apply, so the write lands
+#: correctly whatever order the panel was carrying beforehand.
 REG_SAFE_STATE_TIMEOUT = 4062  # UINT16, 0..60 s (0 disables)
 REG_SAFE_STATE_BITMASK = 4063  # UINT32 segment mask shown on comms loss
 REG_SAFE_STATE_COLOUR = 4065  # ENUM3
@@ -135,15 +139,6 @@ class DisplayMode(IntEnum):
     NUMBER_TICKER = 2
 
 
-class ByteOrder(IntEnum):
-    """Register 4061 — the display's interpretation of multi-register values."""
-
-    UNCHANGED = 0
-    SWAP_BYTES = 1
-    SWAP_REGISTERS = 2
-    SWAP_BYTES_AND_REGISTERS = 3
-
-
 #: Registers 4100..4108 inclusive — colour through decimal point. Writing the
 #: whole run in one FC16 is how we push a full display state atomically.
 DISPLAY_BLOCK_START = REG_COLOUR
@@ -193,54 +188,25 @@ def parse_colour(value) -> Colour:
 #
 # pydoover's modbus interface takes and returns registers as plain ints, so
 # anything wider than 16 bits has to be split here. The display applies its own
-# Byte order parameter (register 4061) on top of whatever we send: at the
-# default UNCHANGED, the value 0xAABBCCDD arrives as registers [0xAABB, 0xCCDD]
-# — i.e. most-significant word first, which is the usual Modbus convention.
-#
-# We keep ``swap_words``/``swap_bytes`` knobs rather than hard-coding that,
-# because a display that was previously commissioned by someone else may have a
-# non-default byte order saved in its flash, and re-flashing it just to run this
-# app would be a worse trade than flipping a config toggle.
+# Byte order parameter (register 4061) on top of whatever we send, and the app
+# pins that to UNCHANGED at startup — so the encoding here is always the usual
+# Modbus convention: 0xAABBCCDD goes out as [0xAABB, 0xCCDD], most significant
+# word first.
 
 
-def _apply_word_order(
-    words: list[int], swap_words: bool, swap_bytes: bool
-) -> list[int]:
-    if swap_bytes:
-        words = [((w & 0xFF) << 8) | ((w >> 8) & 0xFF) for w in words]
-    if swap_words:
-        words = list(reversed(words))
-    return words
-
-
-def float_to_registers(
-    value: float, swap_words: bool = False, swap_bytes: bool = False
-) -> list[int]:
+def float_to_registers(value: float) -> list[int]:
     """Encode a Python float as two registers of IEEE-754 single precision."""
     if not math.isfinite(value):
         raise ValueError(f"cannot display non-finite value: {value!r}")
-    raw = struct.unpack(">HH", struct.pack(">f", float(value)))
-    return _apply_word_order(list(raw), swap_words, swap_bytes)
+    return list(struct.unpack(">HH", struct.pack(">f", float(value))))
 
 
-def uint32_to_registers(
-    value: int, swap_words: bool = False, swap_bytes: bool = False
-) -> list[int]:
+def uint32_to_registers(value: int) -> list[int]:
     """Encode an unsigned 32-bit integer as two registers."""
     value = int(value)
     if not 0 <= value <= 0xFFFFFFFF:
         raise ValueError(f"value out of UINT32 range: {value}")
-    return _apply_word_order(
-        [(value >> 16) & 0xFFFF, value & 0xFFFF], swap_words, swap_bytes
-    )
-
-
-def int16_to_register(value: int) -> int:
-    """Encode a signed 16-bit integer as one register (two's complement)."""
-    value = int(value)
-    if not -32768 <= value <= 32767:
-        raise ValueError(f"value out of INT16 range: {value}")
-    return value & 0xFFFF
+    return [(value >> 16) & 0xFFFF, value & 0xFFFF]
 
 
 # --------------------------------------------------------------------------
@@ -278,7 +244,7 @@ def sanitise_string(text: str) -> str:
     return "".join(out)
 
 
-def string_to_registers(text: str, swap_bytes: bool = False) -> tuple[list[int], int]:
+def string_to_registers(text: str) -> tuple[list[int], int]:
     """Encode text into the display's 16-register string field.
 
     Returns the register list (always :data:`STRING_REGISTERS` long, because
@@ -293,12 +259,10 @@ def string_to_registers(text: str, swap_bytes: bool = False) -> tuple[list[int],
     visible = max(4, min(STRING_MAX_CHARS, len(text)))
     padded = text.ljust(STRING_MAX_CHARS, " ")
 
-    registers = []
-    for i in range(0, STRING_MAX_CHARS, 2):
-        hi, lo = ord(padded[i]), ord(padded[i + 1])
-        if swap_bytes:
-            hi, lo = lo, hi
-        registers.append((hi << 8) | lo)
+    registers = [
+        (ord(padded[i]) << 8) | ord(padded[i + 1])
+        for i in range(0, STRING_MAX_CHARS, 2)
+    ]
     return registers, visible
 
 
@@ -340,3 +304,42 @@ def decimal_point_for(value: float, requested: int | None = None) -> int:
 def value_fits(value: float) -> bool:
     """Whether a numeric value is inside the panel's static display range."""
     return DISPLAY_MIN <= value <= DISPLAY_MAX
+
+
+# --------------------------------------------------------------------------
+# TIME encoding
+# --------------------------------------------------------------------------
+#
+# Data type 7 (TIME) is a *formatting* mode, not a clock: the display takes the
+# UINT32 in register 4252 and renders it as MM:SS by integer division — the
+# manual's footnote to Table 4.7 spells it out, "XX = N / 60 (integer
+# quotient), YY = N / 60 (remainder). If N = 1000, 16:40 is displayed". It does
+# not decrement anything, so a countdown still writes a new value every second;
+# what TIME buys is that 1200 reads as 20:00 instead of as a meaningless
+# four-digit number.
+#
+# Leading zeros, decimal point, offset and factor are documented (Table 4.6) as
+# applying to integer and floating-point variables only, so none of them touch
+# a TIME value.
+
+#: Highest value the TIME type accepts (Table 4.7), i.e. 99:59. Above this the
+#: panel shows the out-of-range error ErrH (Table 4.11) rather than wrapping.
+TIME_MAX_SECONDS = 5999
+
+
+def time_fits(seconds: int) -> bool:
+    """Whether a second count can be shown as MM:SS on the panel."""
+    return 0 <= int(seconds) <= TIME_MAX_SECONDS
+
+
+def format_time(seconds: int) -> str:
+    """Render *seconds* the way the panel will, for the status tag.
+
+    Mirrors the display's own integer division so the tag and the glass agree.
+    """
+    seconds = int(seconds)
+    if not time_fits(seconds):
+        raise ValueError(
+            f"{seconds}s is outside the display's MM:SS range (0..{TIME_MAX_SECONDS})"
+        )
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
