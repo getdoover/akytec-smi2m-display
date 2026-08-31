@@ -22,6 +22,24 @@ full display state on startup anyway.
 IMAGE data type (6) interprets register 4250 as a bitmask of lit segments
 (Table 4.8), so a mask of 0 lights nothing and the panel goes dark. That is a
 genuine blank rather than showing "0" or a stale reading.
+
+**Every 32-bit value goes out low word first.** The panel stores a REAL32 or a
+UINT32 with the least significant register at the lower address, which is the
+opposite of the byte order the Modbus wire format suggests. This is not
+configurable away: register 4061 accepts 0..3 but none of them changed the
+ordering on a live unit. Two independent confirmations, both on hardware:
+
+* The panel's own factory default *factor* (a REAL32 of 1.0) reads back from
+  registers 4111/4112 as ``[0x0000, 0x3F80]`` — low word at the lower address.
+* Writing ``[0x0000, 0x005A]`` to the TIME registers is rejected with Modbus
+  exception 3, because the panel reads it as 90 << 16 seconds, far past its
+  5999 s limit; ``[0x005A, 0x0000]`` is accepted and shows ``01:30``.
+
+Beware the second one in particular: the TIME type is the only value field the
+panel range-checks, so it is the only one that *tells you* the order is wrong.
+A REAL in the wrong order is accepted silently and simply shows the wrong
+number. A read-back proves nothing either — the registers echo whatever was
+written, whatever the panel makes of it.
 """
 
 from __future__ import annotations
@@ -52,8 +70,10 @@ REG_SAVE_TO_FLASH = 5000  # ENUM2: writing 1 commits RAM config to flash
 
 # -- Modbus common --
 REG_BYTE_ORDER = 4061  # ENUM4: 0 unchanged, 1 swap bytes, 2 swap regs, 3 both
-#: Written as 0 (UNCHANGED) at startup so the encoders above can assume plain
-#: big-endian ordering rather than carrying a pair of config toggles. Zero is
+#: Written as 0 (UNCHANGED) at startup: the encoders below match the panel's
+#: native ordering, so there is nothing to swap. Setting it to 1, 2 or 3 was
+#: tried on a live unit and changed nothing about how a written value was
+#: interpreted, so this register is pinned rather than trusted. Zero is
 #: invariant under every swap the display can apply, so the write lands
 #: correctly whatever order the panel was carrying beforehand.
 REG_SAFE_STATE_TIMEOUT = 4062  # UINT16, 0..60 s (0 disables)
@@ -195,18 +215,22 @@ def parse_colour(value) -> Colour:
 
 
 def float_to_registers(value: float) -> list[int]:
-    """Encode a Python float as two registers of IEEE-754 single precision."""
+    """Encode a Python float as two registers of IEEE-754 single precision.
+
+    Low word first — see the note on 32-bit ordering in the module docstring.
+    """
     if not math.isfinite(value):
         raise ValueError(f"cannot display non-finite value: {value!r}")
-    return list(struct.unpack(">HH", struct.pack(">f", float(value))))
+    high, low = struct.unpack(">HH", struct.pack(">f", float(value)))
+    return [low, high]
 
 
 def uint32_to_registers(value: int) -> list[int]:
-    """Encode an unsigned 32-bit integer as two registers."""
+    """Encode an unsigned 32-bit integer as two registers, low word first."""
     value = int(value)
     if not 0 <= value <= 0xFFFFFFFF:
         raise ValueError(f"value out of UINT32 range: {value}")
-    return [(value >> 16) & 0xFFFF, value & 0xFFFF]
+    return [value & 0xFFFF, (value >> 16) & 0xFFFF]
 
 
 # --------------------------------------------------------------------------

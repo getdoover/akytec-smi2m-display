@@ -29,10 +29,15 @@ from smi2m_display.smi2m_driver import (
 
 
 class TestFloatEncoding:
-    def test_matches_hardware_readback(self):
-        # Confirmed on device: writing 123.4 to register 4206 reads back as
-        # [17142, 52429], i.e. most-significant word first.
-        assert float_to_registers(123.4) == [17142, 52429]
+    def test_low_word_first(self):
+        # The panel stores a REAL32 with its least significant register at the
+        # lower address. Confirmed on hardware two ways: the panel's own
+        # default factor of 1.0 sits in 4111/4112 as [0x0000, 0x3F80], and
+        # writing 22.0 this way round is the only order that renders "22.00".
+        #
+        # A register read-back cannot confirm this — the registers echo
+        # whatever was written. Only what the glass shows does.
+        assert float_to_registers(123.4) == [52429, 17142]
 
     def test_zero(self):
         assert float_to_registers(0.0) == [0, 0]
@@ -46,8 +51,14 @@ class TestFloatEncoding:
 
 
 class TestIntegerEncoding:
-    def test_uint32_splits_high_word_first(self):
-        assert uint32_to_registers(0xAABBCCDD) == [0xAABB, 0xCCDD]
+    def test_uint32_splits_low_word_first(self):
+        assert uint32_to_registers(0xAABBCCDD) == [0xCCDD, 0xAABB]
+
+    def test_uint32_time_value_matches_hardware(self):
+        # 90 s written as [0x005A, 0x0000] is accepted and reads 01:30 on the
+        # panel; the other order is rejected with Modbus exception 3, because
+        # the panel sees 90 << 16 seconds and its TIME range stops at 5999.
+        assert uint32_to_registers(90) == [90, 0]
 
     def test_uint32_zero_is_the_blank_bitmask(self):
         assert uint32_to_registers(0) == [0, 0]

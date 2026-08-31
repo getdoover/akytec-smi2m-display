@@ -172,7 +172,7 @@ class TestShowNumber:
     async def test_writes_display_block_and_real_value(self, app):
         await app.show(123.4)
         writes = dict(app.modbus_iface.pop())
-        assert writes[REG_VALUE_REAL] == [17142, 52429]
+        assert writes[REG_VALUE_REAL] == [52429, 17142]  # low word first
         block = writes[DISPLAY_BLOCK_START]
         assert block[TYPE_IDX] == DataType.REAL
         assert block[MODE_IDX] == DisplayMode.STATIC
@@ -184,7 +184,7 @@ class TestShowNumber:
 
     async def test_numeric_string_is_shown_as_a_number(self, app):
         await app.show("12.5")
-        assert dict(app.modbus_iface.pop())[REG_VALUE_REAL] == [16712, 0]
+        assert dict(app.modbus_iface.pop())[REG_VALUE_REAL] == [0, 16712]  # low word first
 
     async def test_as_text_forces_text_rendering(self, app):
         await app.show("0012", as_text=True)
@@ -271,7 +271,7 @@ class TestWriteDiffing:
         # stay stale forever while the app believed it was up to date.
         app.modbus_iface.fail = False
         assert await app._flush() is True
-        assert dict(app.modbus_iface.pop())[REG_VALUE_REAL] == [16940, 0]
+        assert dict(app.modbus_iface.pop())[REG_VALUE_REAL] == [0, 16940]  # low word first
         assert app.tags.comms_ok.get() is True
 
     async def test_exception_is_reported_not_raised_out_of_flush(self, app):
@@ -491,7 +491,7 @@ class TestCountdown:
         written = dict(app.modbus_iface.pop())
         assert written[DISPLAY_BLOCK_START][TYPE_IDX] == int(DataType.TIME)
         # 1200 raw seconds; the display does the /60 itself.
-        assert written[REG_VALUE_TIME] == [0, 1200]
+        assert written[REG_VALUE_TIME] == [1200, 0]  # low word first
         assert app.status()["displayed"] == "20:00"
 
     async def test_as_time_false_keeps_a_bare_second_count(self, app):

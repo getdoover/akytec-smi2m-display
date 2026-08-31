@@ -36,6 +36,13 @@ in `application.py`.
   Firing the RPC once saves messages, not bus traffic.
 - **Blanking is an IMAGE write of bitmask 0**, not a value write — there is no
   off register, and writing `0` would show a literal zero.
+- **Every 32-bit value goes out low word first.** REAL32 and UINT32 fields
+  store the least significant register at the lower address, the opposite of
+  what the wire format suggests, and register 4061 will not change it. Only
+  `TIME` range-checks its value, so a wrong order shows up there as Modbus
+  exception 3 and everywhere else as a silently wrong number. Register
+  read-back cannot confirm an ordering — the registers echo what was written,
+  whatever the panel makes of it. Verify on the glass.
 - **Strings are always 16 registers.** In SLAVE mode the display rejects
   partial string reads/writes with Modbus exception 2 (confirmed on hardware).
   Short messages are space-padded to the full 32 characters.
