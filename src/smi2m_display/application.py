@@ -142,6 +142,18 @@ class SMI2MApplication(Application):
     # Display state
     # -----------------------------------------------------------------
 
+    def _set_desired(self, blocks: dict[int, list[int]]):
+        """Replace what the panel should show, keeping the device config.
+
+        The configuration registers ride along in the desired state rather than
+        being written once at startup, so the resync re-asserts them. A panel
+        swapped in or power-cycled mid-run comes back holding its own flash
+        settings — including the comms-loss failsafe, which these ship with
+        armed — and only a rewrite corrects it. Between resyncs the diff keeps
+        them off the bus, so this costs one extra transaction per resync.
+        """
+        self._desired = {**self._device_config(), **blocks}
+
     def _display_block(
         self, data_type: DataType, mode: DisplayMode, decimal_point: int
     ) -> list[int]:
@@ -175,10 +187,12 @@ class SMI2MApplication(Application):
             mode = DisplayMode.NUMBER_TICKER
             dp = 0 if decimals is None else max(0, min(3, int(decimals)))
 
-        self._desired = {
-            DISPLAY_BLOCK_START: self._display_block(DataType.REAL, mode, dp),
-            REG_VALUE_REAL: float_to_registers(value),
-        }
+        self._set_desired(
+            {
+                DISPLAY_BLOCK_START: self._display_block(DataType.REAL, mode, dp),
+                REG_VALUE_REAL: float_to_registers(value),
+            }
+        )
         self._display_text = self._render_number(value, dp)
 
     @staticmethod
@@ -197,11 +211,13 @@ class SMI2MApplication(Application):
         )
 
         registers, length = string_to_registers(cleaned)
-        self._desired = {
-            DISPLAY_BLOCK_START: self._display_block(DataType.STRING, mode, 0),
-            REG_VALUE_STRING: registers,
-            REG_STRING_LENGTH: [length],
-        }
+        self._set_desired(
+            {
+                DISPLAY_BLOCK_START: self._display_block(DataType.STRING, mode, 0),
+                REG_VALUE_STRING: registers,
+                REG_STRING_LENGTH: [length],
+            }
+        )
         self._display_text = cleaned
 
     def _show_time(self, seconds: int):
@@ -218,12 +234,14 @@ class SMI2MApplication(Application):
                 f"is 0..{TIME_MAX_SECONDS} seconds (99:59)"
             )
 
-        self._desired = {
-            DISPLAY_BLOCK_START: self._display_block(
-                DataType.TIME, DisplayMode.STATIC, 0
-            ),
-            REG_VALUE_TIME: uint32_to_registers(seconds),
-        }
+        self._set_desired(
+            {
+                DISPLAY_BLOCK_START: self._display_block(
+                    DataType.TIME, DisplayMode.STATIC, 0
+                ),
+                REG_VALUE_TIME: uint32_to_registers(seconds),
+            }
+        )
         self._display_text = format_time(seconds)
 
     async def _blank(self):
@@ -232,12 +250,14 @@ class SMI2MApplication(Application):
         Done as an IMAGE write of an empty bitmask rather than by writing 0 or
         spaces, so the panel is genuinely dark instead of reading "0".
         """
-        self._desired = {
-            DISPLAY_BLOCK_START: self._display_block(
-                DataType.IMAGE, DisplayMode.STATIC, 0
-            ),
-            REG_VALUE_IMAGE: uint32_to_registers(BLANK_IMAGE),
-        }
+        self._set_desired(
+            {
+                DISPLAY_BLOCK_START: self._display_block(
+                    DataType.IMAGE, DisplayMode.STATIC, 0
+                ),
+                REG_VALUE_IMAGE: uint32_to_registers(BLANK_IMAGE),
+            }
+        )
         self._display_text = ""
         self._expires_at = None
         await self._flush()
@@ -382,22 +402,49 @@ class SMI2MApplication(Application):
         await self.tags.comms_ok.set(False)
         await self.tags.last_error.set(message[:200])
 
-    async def _apply_device_config(self):
-        """Pin the panel's byte order and configure its comms-loss failsafe.
+    def _device_config(self) -> dict[int, list[int]]:
+        """The panel's byte order and comms-loss failsafe, as desired state.
 
-        This is the only place the app touches configuration registers rather
-        than value registers, and it still does not write Save-to-Flash: the
-        setting is re-applied on every app start, which costs one write per
-        boot instead of spending the panel's finite flash budget.
+        These are configuration registers rather than value registers, and
+        writing them still does not touch Save-to-Flash: they are re-asserted
+        from RAM on every resync, which costs one transaction per resync
+        instead of spending the panel's finite flash budget.
 
-        The setting is written **unconditionally**, including the disabling
+        The failsafe is written **unconditionally**, including the disabling
         zero. Skipping the write when the app wants it off would only ever arm
         the failsafe and never disarm it: a display carrying an armed timeout
-        in its own flash (they ship with one) would keep it forever, and the
-        symptom is brutal to read — the panel shows the value for an instant
-        after each write and sits on the safe-state pattern in between, so it
-        looks like the app is writing garbage rather than like a failsafe
-        firing on schedule.
+        in its own flash (they ship with one at 1 s, over a dash bitmask) would
+        keep it forever, and the symptom is brutal to read — the panel shows
+        the value for an instant after each write and sits on the safe-state
+        pattern in between, so it looks like the app is writing garbage rather
+        than like a failsafe firing on schedule.
+
+        These five registers happen to be contiguous (4061..4066), but naming
+        them individually and letting _coalesce merge the run keeps the offsets
+        honest against the datasheet instead of hiding them in index
+        arithmetic.
+
+        Byte order goes first and is pinned to UNCHANGED, which is what lets
+        every encoder in the driver assume plain big-endian ordering instead of
+        carrying a pair of "my numbers look wild" config toggles. A panel
+        commissioned by someone else may have a swapped order in its flash, and
+        that would garble this very frame — except that every value in it is
+        either a single register or zero, and zero is invariant under all four
+        orderings.
+        """
+        return {
+            REG_BYTE_ORDER: [0],
+            REG_SAFE_STATE_TIMEOUT: [int(self.config.safe_state_timeout.value or 0)],
+            REG_SAFE_STATE_BITMASK: uint32_to_registers(BLANK_IMAGE),
+            REG_SAFE_STATE_COLOUR: [int(Colour.RED)],
+            REG_SAFE_STATE_BLINKING: [0],
+        }
+
+    async def _apply_device_config(self):
+        """Write the device configuration once at startup.
+
+        The resync re-asserts it from then on, so this is about failing loudly
+        at boot rather than about being the only chance to apply it.
         """
         timeout = int(self.config.safe_state_timeout.value or 0)
 
@@ -413,29 +460,11 @@ class SMI2MApplication(Application):
                 resync,
             )
 
-        # These five registers happen to be contiguous (4061..4066), but naming
-        # them individually and letting _coalesce merge the run keeps the
-        # offsets honest against the datasheet instead of hiding them in
-        # index arithmetic.
-        #
-        # Byte order goes first and is pinned to UNCHANGED, which is what lets
-        # every encoder in the driver assume plain big-endian ordering instead
-        # of carrying a pair of "my numbers look wild" config toggles. A panel
-        # commissioned by someone else may have a swapped order in its flash,
-        # and that would garble this very frame — except that every value in it
-        # is either a single register or zero, and zero is invariant under all
-        # four orderings.
-        blocks = {
-            REG_BYTE_ORDER: [0],
-            REG_SAFE_STATE_TIMEOUT: [timeout],
-            REG_SAFE_STATE_BITMASK: uint32_to_registers(BLANK_IMAGE),
-            REG_SAFE_STATE_COLOUR: [int(Colour.RED)],
-            REG_SAFE_STATE_BLINKING: [0],
-        }
-        for start, values in self._coalesce(blocks):
-            if not await self._write(start, values):
-                log.warning("Could not write the display's startup configuration")
-                return
+        self._set_desired({})
+        if not await self._flush():
+            # Not fatal any more: the next resync retries it.
+            log.warning("Could not write the display's startup configuration")
+            return
         if timeout > 0:
             log.info("Display safe-state failsafe armed at %ds", timeout)
         else:

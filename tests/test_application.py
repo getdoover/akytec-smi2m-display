@@ -14,6 +14,9 @@ import pytest
 from smi2m_display.application import SMI2MApplication
 from smi2m_display.smi2m_driver import (
     DISPLAY_BLOCK_START,
+    REG_BYTE_ORDER,
+    REG_SAFE_STATE_BITMASK,
+    REG_SAFE_STATE_TIMEOUT,
     REG_STRING_LENGTH,
     REG_VALUE_IMAGE,
     REG_VALUE_REAL,
@@ -286,9 +289,37 @@ class TestWriteDiffing:
         app.modbus_iface.pop()
         app._last_resync = time.monotonic() - 999
         await app.main_loop()
-        # Recovers a display that was power-cycled while we sat idle.
+        # Recovers a display that was power-cycled while we sat idle — and a
+        # panel swapped in mid-run, which arrives holding its own flash
+        # settings, so the config block goes out again too.
         starts = sorted(start for start, _ in app.modbus_iface.pop())
-        assert starts == sorted([DISPLAY_BLOCK_START, REG_VALUE_REAL])
+        assert starts == sorted([REG_BYTE_ORDER, DISPLAY_BLOCK_START, REG_VALUE_REAL])
+
+    async def test_resync_disarms_a_swapped_in_panels_failsafe(self, app):
+        """The failure this guards: a screen swapped in while the app runs.
+
+        Its flash ships the comms-loss failsafe armed at 1s over a dash
+        bitmask, which against a 1Hz write interval shows as the panel
+        flicking to "----" every few seconds. Nothing else disarms it.
+        """
+        await app.show(42)
+        app.modbus_iface.pop()
+        app._last_resync = time.monotonic() - 999
+        await app.main_loop()
+
+        writes = dict(app.modbus_iface.pop())
+        # 4061..4066 coalesce into one transaction starting at the byte order.
+        config = writes[REG_BYTE_ORDER]
+        assert config[REG_SAFE_STATE_TIMEOUT - REG_BYTE_ORDER] == 0
+        assert config[REG_SAFE_STATE_BITMASK - REG_BYTE_ORDER] == 0
+        assert config[REG_SAFE_STATE_BITMASK + 1 - REG_BYTE_ORDER] == 0
+
+    async def test_config_stays_off_the_bus_between_resyncs(self, app):
+        """The diff is what keeps a 1Hz loop off a 9600 baud line."""
+        await app.show(42)
+        app.modbus_iface.pop()
+        await app.show(43)
+        assert REG_BYTE_ORDER not in dict(app.modbus_iface.pop())
 
 
 class TestBlankTimeout:

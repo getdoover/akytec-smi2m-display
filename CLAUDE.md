@@ -30,6 +30,18 @@ in `application.py`.
 - **Never write register 5000 (Save-to-Flash).** Display config is RAM-only by
   design here; flash has a finite write budget. The resync loop, not flash,
   is what survives a display power cycle.
+- **Panels ship with the comms-loss failsafe armed at 1 s**, over a safe-state
+  bitmask of `0x70404046` — every byte has bit 6 (segment G) set, so the
+  pattern is literally `----`. Against a 1 Hz write interval that is a coin
+  flip, and the panel flicks to dashes at an interval that looks random.
+  Confirmed on hardware after a screen swap in the field. The app disarms it
+  (4062 = 0, mask 0), and `_device_config()` rides in the desired state so the
+  **resync re-asserts it** — a screen swapped in or power-cycled mid-run
+  self-heals within `resync_interval` instead of needing an app restart. Before
+  that fix, swapping a screen while the app ran left the new panel on its own
+  flash settings forever, which is exactly how this presented: swapping
+  screens, cables and Doovits changed nothing, because every fresh panel
+  arrives armed.
 - **The display has no timer.** `countdown` is driven entirely by the app's
   1 Hz loop; data type 7 (`TIME`, register 4252) only *formats* a raw second
   count as MM:SS, capped at 5999 s (99:59) before the panel shows `ErrH`.
